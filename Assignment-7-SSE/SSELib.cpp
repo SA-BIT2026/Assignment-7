@@ -1,6 +1,6 @@
 /**
  * SSELib.cpp
- * @author kisslune 
+ * @author kisslune
  */
 
 #include "SSEHeader.h"
@@ -11,52 +11,122 @@ using namespace SVFUtil;
 using namespace llvm;
 using namespace z3;
 
-/// TODO: Implement your context-sensitive ICFG traversal here to traverse each program path (once for any loop) from
-/// You will need to collect each path from src node to snk node and then add the path to the `paths` set by
-/// calling the `collectAndTranslatePath` method, in which translatePath method is called.
-/// This implementation, slightly different from Assignment-1, requires ICFGNode* as the first argument.
+/// Traverse the ICFG from the program entry to each assertion. A call opens a
+/// new scope in the visited set so the same callee can be walked again from a
+/// different call site, and a return is only taken when it matches the call at
+/// the top of the stack. This avoids the bogus cross-call paths that a plain
+/// "no repeated node" walk would produce.
 void SSE::reachability(const ICFGEdge* curEdge, const ICFGNode* snk) {
-    /// TODO: your code starts from here
+    const ICFGNode* curNode = curEdge->getDstNode();
+    if (curNode == nullptr)
+        return;
+
+    // Key the visited set on (edge, callstack) so a call/return cycle in one
+    // context does not block the same edge in a different context, while a
+    // plain loop inside one activation is still cut off.
+    ICFGEdgeStackPair key(curEdge, callstack);
+    if (visited.find(key) != visited.end())
+        return;
+    visited.insert(key);
+
+    path.push_back(curEdge);
+
+    if (curNode == snk)
+    {
+        collectAndTranslatePath();
+        path.pop_back();
+        return;
+    }
+
+    bool openedCall = false;
+    bool closedRet = false;
+    if (const CallCFGEdge* callEdge = SVFUtil::dyn_cast<CallCFGEdge>(curEdge))
+    {
+        callstack.push_back(callEdge->getCallSite());
+        openedCall = true;
+    }
+    else if (const RetCFGEdge* retEdge = SVFUtil::dyn_cast<RetCFGEdge>(curEdge))
+    {
+        const CallICFGNode* retCall = retEdge->getCallSite();
+        if (callstack.empty() || callstack.back() != retCall)
+        {
+            path.pop_back();
+            return;
+        }
+        callstack.pop_back();
+        closedRet = true;
+    }
+
+    for (const ICFGEdge* next : curNode->getOutEdges())
+        reachability(next, snk);
+
+    if (openedCall)
+        callstack.pop_back();
+    else if (closedRet)
+        callstack.push_back(SVFUtil::cast<RetCFGEdge>(curEdge)->getCallSite());
+
+    path.pop_back();
 }
 
-/// TODO: collect each path once this method is called during reachability analysis, and
-/// Collect each program path from the entry to each assertion of the program. In this function,
-/// you will need (1) add each path into the paths set; (2) call translatePath to convert each path into Z3 expressions.
-/// Note that translatePath returns true if the path is feasible, false if the path is infeasible; (3) If a path is feasible,
-/// you will need to call assertchecking to verify the assertion (which is the last ICFGNode of this path); (4) reset z3 solver.
+/// Translate every collected path, verify its assertion, and restore the
+/// solver for the next path.
 void SSE::collectAndTranslatePath() {
-    /// TODO: your code starts from here
+    paths.insert(z3Mgr->callingCtxToStr(callingCtx));
+    if (translatePath(path) == false)
+        return;
+    assertchecking(path.back()->getDstNode());
+    resetSolver();
 }
 
-/// TODO: Implement handling of function calls
+/// Enter a callee: remember the call site for both context-sensitive variable
+/// naming and call/return matching, then bind actual arguments to formals.
 void SSE::handleCall(const CallCFGEdge* calledge) {
-    /// TODO: your code starts from here
+    const CallICFGNode* cs = calledge->getCallSite();
 
+    // The actual argument lives in the caller context, the formal parameter
+    // in the callee context, so read the two sides on opposite sides of push.
+    for (const CallPE* callPE : calledge->getCallPEs())
+    {
+        expr actual = getZ3Expr(callPE->getRHSVarID());
+        pushCallingCtx(cs);
+        expr formal = getZ3Expr(callPE->getLHSVarID());
+        popCallingCtx();
+        addToSolver(formal == actual);
+    }
+    pushCallingCtx(cs);
 }
 
-/// TODO: Implement handling of function returns
+/// Leave a callee: restore the caller context and pass the return value back.
 void SSE::handleRet(const RetCFGEdge* retEdge) {
-    /// TODO: your code starts from here
-
+    const RetPE* retPE = retEdge->getRetPE();
+    if (retPE != nullptr)
+    {
+        // The returned value belongs to the callee context; the receiving
+        // variable belongs to the caller context.
+        expr returned = getZ3Expr(retPE->getRHSVarID());
+        popCallingCtx();
+        expr received = getZ3Expr(retPE->getLHSVarID());
+        addToSolver(received == returned);
+    }
+    else
+        popCallingCtx();
 }
 
-/// TODO: Implement handling of branch statements inside a function
-/// Return true if the path is feasible, false otherwise.
-/// A given if/else branch on the ICFG looks like the following:
-///       	     ICFGNode1 (condition %cmp)
-///       	     1	/    \  0
-///       	  ICFGNode2   ICFGNode3
-/// edge->getCondition() returns the branch condition variable (%cmp) of type SVFValue* (for if/else) or a numeric condition variable (for switch).
-/// Given the condition variable, you could obtain the SVFVar ID via "edge->getCondition()->getId()"
-/// edge->getCondition() returns nullptr if this IntraCFGEdge is not a branch.
-/// edge->getSuccessorCondValue() returns the actual condition value (1/0 for if/else) when this branch/IntraCFGEdge is executed. For example, the successorCondValue is 1 on the edge from ICFGNode1 to ICFGNode2, and 0 on the edge from ICFGNode1 to ICFGNode3
+/// A conditional edge is feasible only when the branch condition equals the
+/// value that selects this successor. Ask Z3 before continuing so dead paths
+/// are dropped early.
 bool SSE::handleBranch(const IntraCFGEdge* edge) {
-    /// TODO: your code starts from here
-    return true;
+    const SVFVar* condVar = edge->getCondition();
+    if (condVar == nullptr)
+        return true;
+
+    expr cond = getZ3Expr(condVar->getId());
+    expr expected = getCtx().int_val(static_cast<int>(edge->getSuccessorCondValue()));
+    addToSolver(cond == expected);
+    return getSolver().check() != z3::unsat;
 }
 
-/// TODO: Translate AddrStmt, CopyStmt, LoadStmt, StoreStmt, GepStmt and CmpStmt
-/// Translate AddrStmt, CopyStmt, LoadStmt, StoreStmt, GepStmt, BinaryOPStmt, CmpStmt, SelectStmt, and PhiStmt
+/// Translate the statements attached to the destination node of an edge.
 bool SSE::handleNonBranch(const IntraCFGEdge* edge) {
     const ICFGNode* dstNode = edge->getDstNode();
     const ICFGNode* srcNode = edge->getSrcNode();
@@ -66,33 +136,60 @@ bool SSE::handleNonBranch(const IntraCFGEdge* edge) {
     {
         if (const AddrStmt *addr = SVFUtil::dyn_cast<AddrStmt>(stmt))
         {
-            // TODO: implement AddrStmt handler here
+            expr lhs = getZ3Expr(addr->getLHSVarID());
+            expr rhs = getMemObjAddress(addr->getRHSVarID());
+            addToSolver(lhs == rhs);
         }
         else if (const CopyStmt *copy = SVFUtil::dyn_cast<CopyStmt>(stmt))
         {
-            // TODO: implement CopyStmt handler her
+            expr lhs = getZ3Expr(copy->getLHSVarID());
+            expr rhs = getZ3Expr(copy->getRHSVarID());
+            addToSolver(lhs == rhs);
         }
         else if (const LoadStmt *load = SVFUtil::dyn_cast<LoadStmt>(stmt))
         {
-            // TODO: implement LoadStmt handler here
+            expr lhs = getZ3Expr(load->getLHSVarID());
+            expr ptr = getZ3Expr(load->getRHSVarID());
+            addToSolver(lhs == z3Mgr->loadValue(ptr));
         }
         else if (const StoreStmt *store = SVFUtil::dyn_cast<StoreStmt>(stmt))
         {
-            // TODO: implement StoreStmt handler here
+            expr val = getZ3Expr(store->getRHSVarID());
+            expr ptr = getZ3Expr(store->getLHSVarID());
+            z3Mgr->storeValue(ptr, val);
         }
         else if (const GepStmt *gep = SVFUtil::dyn_cast<GepStmt>(stmt))
         {
-            // TODO: implement GepStmt handler here
+            expr lhs = getZ3Expr(gep->getLHSVarID());
+            expr ptr = getZ3Expr(gep->getRHSVarID());
+            s32_t offset = z3Mgr->getGepOffset(gep, callingCtx);
+            addToSolver(lhs == z3Mgr->getGepObjAddress(ptr, offset));
         }
-            /// Given a CmpStmt "r = a > b"
-            /// cmp->getOpVarID(0)/cmp->getOpVarID(1) returns the first/second operand, i.e., "a" and "b"
-            /// cmp->getResID() returns the result operand "r" and cmp->getPredicate() gives you the predicate ">"
-            /// Find the comparison predicates in "class CmpStmt:Predicate" under SVF/svf/include/SVFIR/SVFStatements.h
-            /// You are only required to handle integer predicates, including ICMP_EQ, ICMP_NE, ICMP_UGT, ICMP_UGE, ICMP_ULT, ICMP_ULE, ICMP_SGT, ICMP_SGE, ICMP_SLE, ICMP_SLT
-            /// We assume integer-overflow-free in this assignment
+        /// Given a CmpStmt "r = a > b"
+        /// cmp->getOpVarID(0)/cmp->getOpVarID(1) returns the first/second operand, i.e., "a" and "b"
+        /// cmp->getResID() returns the result operand "r" and cmp->getPredicate() gives you the predicate ">"
+        /// Find the comparison predicates in "class CmpStmt:Predicate" under SVF/svf/include/SVFIR/SVFStatements.h
+        /// You are only required to handle integer predicates, including ICMP_EQ, ICMP_NE, ICMP_UGT, ICMP_UGE, ICMP_ULT, ICMP_ULE, ICMP_SGT, ICMP_SGE, ICMP_SLE, ICMP_SLT
+        /// We assume integer-overflow-free in this assignment
         else if (const CmpStmt *cmp = SVFUtil::dyn_cast<CmpStmt>(stmt))
         {
-            // TODO: implement CmpStmt handler here
+            expr op0 = getZ3Expr(cmp->getOpVarID(0));
+            expr op1 = getZ3Expr(cmp->getOpVarID(1));
+            expr res = getZ3Expr(cmp->getResID());
+            switch (cmp->getPredicate())
+            {
+                case CmpStmt::ICMP_EQ: addToSolver(res == ite(op0 == op1, getCtx().int_val(1), getCtx().int_val(0))); break;
+                case CmpStmt::ICMP_NE: addToSolver(res == ite(op0 != op1, getCtx().int_val(1), getCtx().int_val(0))); break;
+                case CmpStmt::ICMP_UGT:
+                case CmpStmt::ICMP_SGT: addToSolver(res == ite(op0 > op1, getCtx().int_val(1), getCtx().int_val(0))); break;
+                case CmpStmt::ICMP_UGE:
+                case CmpStmt::ICMP_SGE: addToSolver(res == ite(op0 >= op1, getCtx().int_val(1), getCtx().int_val(0))); break;
+                case CmpStmt::ICMP_ULT:
+                case CmpStmt::ICMP_SLT: addToSolver(res == ite(op0 < op1, getCtx().int_val(1), getCtx().int_val(0))); break;
+                case CmpStmt::ICMP_ULE:
+                case CmpStmt::ICMP_SLE: addToSolver(res == ite(op0 <= op1, getCtx().int_val(1), getCtx().int_val(0))); break;
+                default: assert(false && "unsupported CmpStmt predicate");
+            }
         }
         else if (const BinaryOPStmt *binary = SVFUtil::dyn_cast<BinaryOPStmt>(stmt))
         {
@@ -191,6 +288,9 @@ void SSE::analyse() {
         assert(SVFUtil::isa<GlobalICFGNode>(src) && "reachability should start with GlobalICFGNode!");
         for (const ICFGNode* sink : identifySinks()) {
             const IntraCFGEdge startEdge(nullptr, const_cast<ICFGNode*>(src));
+            // Visited edges are only valid for one sink: clearing them here
+            // lets the next assertion see all paths from the entry again.
+            visited.clear();
             /// start traversing from the entry to each assertion and translate each path
             reachability(&startEdge, sink);
             resetSolver();
